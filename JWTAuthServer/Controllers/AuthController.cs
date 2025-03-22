@@ -1,6 +1,7 @@
 ﻿using JWTAuthServer.Data;
 using JWTAuthServer.DTOs;
 using JWTAuthServer.Models;
+using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
@@ -8,6 +9,7 @@ using Microsoft.IdentityModel.Tokens;
 using System.IdentityModel.Tokens.Jwt;
 using System.Security.Claims;
 using System.Security.Cryptography;
+using System.Text;
 
 namespace JWTAuthServer.Controllers
 {
@@ -48,7 +50,75 @@ namespace JWTAuthServer.Controllers
                 return Unauthorized("Invalid credentials.");
             }
             var token = GenerateJwtToken(user, client);
-            return Ok(new { Token = token });
+            var refreshToken = GenerateRefreshToken();
+            var hashedRefreshToken = HashToken(refreshToken);
+            var refreshTokenEntity = new RefreshToken
+            {
+                Token = hashedRefreshToken,
+                UserId = user.Id,
+                ClientId = client.Id,
+                ExpiresAt = DateTime.UtcNow.AddDays(7),
+                CreatedAt = DateTime.UtcNow,
+                IsRevoked = false
+            };
+            
+            _context.RefreshTokens.Add(refreshTokenEntity);
+            await _context.SaveChangesAsync();
+            return Ok(new RefreshTokenResponseDTO
+            {
+                Token = token,
+                RefreshToken = refreshToken
+            });
+        }
+        [Authorize]
+        [HttpPost("Logout")]
+        public async Task<IActionResult> Logout([FromBody] LogoutRequestDTO requestDto)
+        {
+            if (!ModelState.IsValid)
+            {
+                return BadRequest(ModelState);
+            }
+            var userIdClaim = User.Claims.FirstOrDefault(c => c.Type == ClaimTypes.NameIdentifier);
+            if (userIdClaim == null)
+            {
+                return Unauthorized("Invalid access token.");
+            }
+            
+            if (!int.TryParse(userIdClaim.Value, out int userId))
+            {
+                return Unauthorized("Invalid user ID in access token.");
+            }
+            var hashedToken = HashToken(requestDto.RefreshToken);
+            var storedRefreshToken = await _context.RefreshTokens
+                .Include(rt => rt.User)
+                .Include(rt => rt.Client)
+                .FirstOrDefaultAsync(rt => rt.Token == hashedToken && rt.Client.ClientId == requestDto.ClientId && rt.UserId == userId);
+            if (storedRefreshToken == null)
+            {
+                return Unauthorized("Invalid refresh token.");
+            }
+            if (storedRefreshToken.IsRevoked)
+            {
+                return BadRequest("Refresh token is already revoked.");
+            }
+            storedRefreshToken.IsRevoked = true;
+            storedRefreshToken.RevokedAt = DateTime.UtcNow;
+            if (requestDto.IsLogoutFromAllDevices)
+            {
+                var userRefreshTokens = await _context.RefreshTokens
+                    .Where(rt => rt.UserId == storedRefreshToken.UserId && !rt.IsRevoked)
+                    .ToListAsync();
+                foreach (var token in userRefreshTokens)
+                {
+                    token.IsRevoked = true;
+                    token.RevokedAt = DateTime.UtcNow;
+                }
+            }
+            await _context.SaveChangesAsync();
+            return Ok(new
+            {
+                Message = "Logout successful. Refresh token has been revoked."
+            });
         }
         // Private method responsible for generating a JWT token for an authenticated user
         private string GenerateJwtToken(User user, Client client)
@@ -89,6 +159,69 @@ namespace JWTAuthServer.Controllers
             var tokenHandler = new JwtSecurityTokenHandler();
             var token = tokenHandler.WriteToken(tokenDescriptor);
             return token;   
+        }
+        [HttpPost("RefreshToken")]
+        public async Task<IActionResult> RefreshToken([FromBody] RefreshTokenRequestDTO requestDto)
+        {
+            if (!ModelState.IsValid)
+            {
+                return BadRequest(ModelState);
+            }
+            var hashedToken = HashToken(requestDto.RefreshToken);
+            var storedRefreshToken = await _context.RefreshTokens.Include(rt => rt.User).ThenInclude(rt => rt.UserRoles).ThenInclude(rt => rt.Role)
+                .Include(rt => rt.Client).FirstOrDefaultAsync(rt => rt.Token == hashedToken && rt.Client.ClientId == requestDto.ClientId);
+            if (storedRefreshToken == null)
+            {
+                return Unauthorized("Invalid refresh token.");
+            }
+            if (storedRefreshToken.IsRevoked)
+            {
+                return Unauthorized("Refresh token has been revoked.");
+            }
+            if (storedRefreshToken.ExpiresAt < DateTime.UtcNow)
+            {
+                return Unauthorized("Refresh token has expired.");
+            }
+            var user = storedRefreshToken.User;
+            var client = storedRefreshToken.Client;
+            storedRefreshToken.IsRevoked = true;
+            storedRefreshToken.RevokedAt = DateTime.UtcNow;
+            var newRefreshToken = GenerateRefreshToken();
+            var hashedNewRefreshToken = HashToken(newRefreshToken);
+            var newRefreshTokenEntity = new RefreshToken
+            {
+                Token = hashedNewRefreshToken,
+                UserId = user.Id,
+                ClientId = client.Id,
+                ExpiresAt = DateTime.UtcNow.AddDays(7), // Adjust as needed
+                CreatedAt = DateTime.UtcNow,
+                IsRevoked = false
+            };
+            _context.RefreshTokens.Add(newRefreshTokenEntity);
+            // Generate new JWT access token
+            var newJwtToken = GenerateJwtToken(user, client);
+            // Save changes to the database
+            await _context.SaveChangesAsync();
+            return Ok(new RefreshTokenResponseDTO
+            {
+                Token = newJwtToken,
+                RefreshToken = newRefreshToken
+            });
+        }
+        private string GenerateRefreshToken()
+        {
+            var randomNumber = new byte[64];
+            using (var rng = RandomNumberGenerator.Create())
+            {
+                rng.GetBytes(randomNumber);
+                return Convert.ToBase64String(randomNumber);
+            }
+        }
+        private string HashToken(string token)
+        {
+            using var sha256 = SHA256.Create();
+            var hashedBytes = sha256.ComputeHash(Encoding.UTF8.GetBytes(token));
+            return Convert.ToBase64String(hashedBytes);
         }
     }
 }

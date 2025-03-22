@@ -17,7 +17,7 @@ namespace JWTAuthServer.Models
         [Required]
         [StringLength(256)]
         public string Password {  get; set; }
-        public ICollection<UserRole> UserRoles { get; set; }    
-
+        public ICollection<UserRole> UserRoles { get; set; }
+        public ICollection<RefreshToken> RefreshTokens { get; set; }
     }
 }

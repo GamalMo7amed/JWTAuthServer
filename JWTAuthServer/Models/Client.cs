@@ -15,5 +15,6 @@ namespace JWTAuthServer.Models
         [Required]
         [MaxLength(200)]
         public string ClientURL { get; set; }
+        public ICollection<RefreshToken> RefreshTokens { get; set; }
     }
 }
